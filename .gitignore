@@ -1,0 +1,42 @@
+# IDE
+.vscode/
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Build
+target/
+node_modules/
+dist/
+build/
+out/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Maven
+.mvn/
+mvnw.cmd
+mvnw
+
+# Node
+npm-debug.log
+yarn-error.log
+.next/
+
+# Database
+*.db
+*.sqlite
+
+# Temporary
+temp/
+tmp/
+*.tmp
