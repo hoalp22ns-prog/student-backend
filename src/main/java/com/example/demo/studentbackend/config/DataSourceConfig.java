@@ -5,10 +5,12 @@ import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.transaction.annotation.EnableTransactionManagement;
 
 import javax.sql.DataSource;
 import java.util.concurrent.Executor;
@@ -45,6 +47,12 @@ import java.util.concurrent.Executor;
 @Configuration
 @EnableAsync        // Kích hoạt @Async trong StudentService
 @EnableScheduling   // Kích hoạt @Scheduled trong StudentService
+@EnableTransactionManagement
+@EnableJpaRepositories(
+    basePackages = "com.example.demo.studentbackend.repository",
+    entityManagerFactoryRef = "entityManagerFactory",
+    transactionManagerRef = "transactionManager"
+)
 public class DataSourceConfig {
 
     // ============================================

@@ -347,4 +347,30 @@ public class DiagnosticService {
         
         return result;
     }
+    
+    /**
+     * 💚 Check if PRIMARY database is healthy (simple ping)
+     */
+    public boolean isPrimaryHealthy() {
+        try {
+            Integer result = primaryJdbc.queryForObject("SELECT 1", Integer.class);
+            return result != null && result == 1;
+        } catch (Exception e) {
+            log.warn("❌ Primary database is NOT healthy: {}", e.getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * 💚 Check if SECONDARY database is healthy (simple ping)
+     */
+    public boolean isSecondaryHealthy() {
+        try {
+            Integer result = secondaryJdbc.queryForObject("SELECT 1", Integer.class);
+            return result != null && result == 1;
+        } catch (Exception e) {
+            log.warn("❌ Secondary database is NOT healthy: {}", e.getMessage());
+            return false;
+        }
+    }
 }
