@@ -4,17 +4,6 @@ import jakarta.persistence.*;
 import lombok.*;
 import java.time.LocalDateTime;
 
- *  - literature: Điểm Văn (0-10)
- *  - english: Điểm Anh (0-10)
- *  - total: Điểm tổng = (math + literature + english) / 3
- *  - createdAt: Thời gian tạo
- *  - updatedAt: Thời gian cập nhật
- * 
- * Relationships:
- *  - Mỗi sinh viên có thể có 1 record điểm
- *  - Foreign key: student_id → students.id
- *  - Khi xóa sinh viên → xóa điểm (ON DELETE CASCADE)
- */
 @Entity
 @Table(name = "grades")
 @Data
