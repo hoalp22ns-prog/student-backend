@@ -152,7 +152,7 @@ curl -X DELETE http://localhost:8080/api/grades/1
 
 ### 1️⃣6️⃣ Đăng Ký Người Dùng Mới
 ```bash
-curl -X POST http://localhost:8080/api/users/register \
+curl -X POST http://localhost:8080n \
   -H "Content-Type: application/json" \
   -d '{
     "username": "student1",

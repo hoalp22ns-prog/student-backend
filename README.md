@@ -1,987 +1,386 @@
-# 📚 Student Backend API - Spring Boot
+# Student Backend API
 
-REST API Backend cho ứng dụng **quản lý sinh viên** với kiến trúc **dual-database** trên cloud (Render + Railway) đảm bảo high availability và zero downtime.
+Backend Spring Boot cho hệ thống quản lý sinh viên. Ứng dụng cung cấp REST API để quản lý sinh viên, điểm số, tài khoản đăng nhập bằng JWT, đồng thời có cơ chế dùng 2 PostgreSQL database: primary database để đọc/ghi chính và secondary database để đồng bộ, dự phòng.
 
-**Stack:** Spring Boot 3.5 + PostgreSQL + Docker
+## Công nghệ sử dụng
 
----
+- Java 17
+- Spring Boot 3.5.11
+- Spring Web
+- Spring Data JPA
+- Spring Security
+- JWT
+- PostgreSQL
+- Lombok
+- Maven Wrapper
+- Docker
 
-## 🎯 Phần 1: Công dụng chi tiết Backend
+## Cây thư mục
 
-### 🔑 Chức năng chính
-
-Backend cung cấp các chức năng sau để quản lý dữ liệu sinh viên:
-
-#### 1. **CRUD Operations - Quản lý Sinh Viên**
-   - **GET /api/students** 
-     - Lấy danh sách toàn bộ sinh viên từ database
-     - Response: `List<Student>`
-   
-   - **GET /api/students/{id}**
-     - Lấy thông tin chi tiết một sinh viên theo ID
-     - Response: `Student` hoặc 404 nếu không tìm thấy
-   
-   - **POST /api/students**
-     - Thêm sinh viên mới
-     - Request body: `{ "name": "", "email": "", "phone": "", "age": 0 }`
-     - Tự động đồng bộ sang database secondary (Railway)
-   
-   - **PUT /api/students/{id}**
-     - Cập nhật thông tin sinh viên
-     - Request body: Dữ liệu cần cập nhật
-     - Dual-write: cập nhật cả Render và Railway
-   
-   - **DELETE /api/students/{id}**
-     - Xóa sinh viên khỏi database
-     - Xóa ở cả 2 database (Render + Railway)
-
-#### 2. **Health Check & Monitor**
-   - **GET /api/students/health/status**
-     - Kiểm tra sức khỏe của backend và database connections
-     - Response: `{ "status": "UP/DOWN", "timestamp": 123456 }`
-     - Dùng để monitor từ Kubernetes, Docker, hoặc monitoring tools
-   
-   - **GET /api/students/health/ping**
-     - Simple health check cho container orchestration (quá nhanh, không kiểm tra DB)
-     - Response: `✅ Service is running`
-
-#### 3. **Admin & Maintenance Endpoints**
-   - **POST /api/students/admin/sync**
-     - Đồng bộ dữ liệu từ Primary DB (Render) sang Secondary DB (Railway)
-     - Dùng cho emergency sync hoặc disaster recovery
-     - Response: `{ "message": "Sync completed", "timestamp": 123456 }`
-   
-   - **GET /api/students/debug/db-info**
-     - Debug endpoint: kiểm tra kết nối database và số lượng records
-     - Hiển thị: JPA count, direct JDBC count, database status
-     - Response: `{ "jpa_count": 5, "direct_jdbc_count": 5, "primary_db_status": "connected" }`
-
-### 🔄 Dual-Database Architecture (Render + Railway)
-
-| Thành phần | Vai trò | Mô tả |
-|-----------|--------|-------|
-| **Render PostgreSQL** | Primary DB | Database chính - tất cả read/write mặc định đi đây |
-| **Railway PostgreSQL** | Secondary DB | Database dự phòng - tự động sync & failover |
-| **Dual-Write Pattern** | Write Logic | Mỗi write operation ghi vào cả 2 database |
-| **Automatic Failover** | Failover | Nếu Render down, tự động fallback sang Railway (read-only) |
-| **Auto Sync** | Sync Logic | Mỗi 5 giây kiểm tra sync status, tự động đồng bộ nếu có sự khác biệt |
-
-### ⚙️ Async & Non-Blocking Operations
-
-- **Initialization**: Khởi tạo secondary table + sync dữ liệu chạy **async** → không block app startup
-- **Sync Operations**: Tất cả sync operations chạy async → request không phải chờ
-- **Health Checks**: Chạy scheduled mỗi 5 giây (background)
-- **Lợi ích**: App startup nhanh, request không bị delay
-
----
-
-## 📂 Phần 2: Cấu trúc File và Công dụng từng File
-
-### Project Structure
-
-```
+```text
 demo/
-├── src/main/java/com/example/demo/
-│   ├── DemoApplication.java
-│   │   └── 🚀 ENTRY POINT: Khởi động Spring Boot app
-│   │          - Quét @Component, @Service, @Controller
-│   │          - Khởi tạo DataSourceConfig (Primary + Secondary DB)
-│   │          - Khởi tạo StudentService (@PostConstruct)
-│   │          - Chạy Tomcat server trên port 8080
-│   │
-│   └── studentbackend/
-│       ├── config/
-│       │   ├── DataSourceConfig.java
-│       │   │   └── ⚙️ CẤU HÌNH DATABASE + ASYNC:
-│       │   │      - @Bean primaryDatasource() → Render (Primary)
-│       │   │      - @Bean secondaryDataSource() → Railway (Secondary)
-│       │   │      - @Bean primaryJdbc & secondaryJdbc → JdbcTemplate
-│       │   │      - @Bean taskExecutor() → ThreadPool (2-5 threads)
-│       │   │      - @EnableAsync + @EnableScheduling
-│       │   │
-│       │   └── CorsConfig.java
-│       │       └── 🔧 CORS CONFIGURATION:
-│       │          - Cho phép frontend từ mọi domain gọi API
-│       │          - allowedOrigins: "*"
-│       │          - allowedMethods: GET, POST, PUT, DELETE, PATCH, OPTIONS
-│       │
-│       ├── model/
-│       │   └── Student.java
-│       │       └── 📊 ENTITY (JPA):
-│       │          - @Entity @Table(name = "students")
-│       │          - Fields: id, name, email, phone, age
-│       │          - @Data (Lombok): tự generate getter/setter
-│       │          - ánh xạ từ Java Object → SQL Table
-│       │
-│       ├── repository/
-│       │   └── StudentRepository.java
-│       │       └── 🏦 JPA REPOSITORY:
-│       │          - Extends JpaRepository<Student, Long>
-│       │          - Tự động hỗ trợ:
-│       │            • findAll() → SELECT *
-│       │            • findById(id) → SELECT WHERE id = ?
-│       │            • save(student) → INSERT/UPDATE
-│       │            • deleteById(id) → DELETE
-│       │          - Chỉ dùng cho Primary DB (Render)
-│       │
-│       ├── service/
-│       │   └── StudentService.java
-│       │       └── 🧠 BUSINESS LOGIC (Dual-DB):
-│       │          1️⃣  @PostConstruct initializeSecondaryDb():
-│       │             - Tạo students table trên Railway
-│       │             - Sync dữ liệu từ Render → Railway (async)
-│       │          
-│       │          2️⃣  READ Operations (Smart Routing):
-│       │             - getAllStudents(): đọc Render → fallback Railway
-│       │             - getStudentById(id): với smart failover
-│       │             - fallbackToSecondary(): query Railway khi Render down
-│       │          
-│       │          3️⃣  WRITE Operations (Dual-Write):
-│       │             - createStudent(): write Render (sync) + write Railway (async)
-│       │             - updateStudent(): update cả 2 DB
-│       │             - deleteStudent(): xóa cả 2 DB
-│       │             - createStudentInSecondary(): failover khi Render down
-│       │          
-│       │          4️⃣  HEALTH CHECK (mỗi 5 giây):
-│       │             - checkPrimaryDbHealth(): ping Render
-│       │             - checkSecondaryDbHealth(): ping Railway
-│       │             - primaryDbHealthy, secondaryDbHealthy (flags)
-│       │          
-│       │          5️⃣  ADMIN ENDPOINTS:
-│       │             - manualSync(): đồng bộ thủ công
-│       │             - resetSecondaryDb(): xóa Railway, sync lại
-│       │             - checkDataConsistency(): kiểm tra dữ liệu
-│       │          
-│       │          6️⃣  ASYNC OPERATIONS:
-│       │             - syncToSecondaryAsync(): chạy background
-│       │             - writeToSecondaryAsync(): write Railway không block
-│       │
-│       ├── controller/
-│       │   └── StudentController.java
-│       │       └── 🎛️ REST API ENDPOINTS:
-│       │          @RestController @RequestMapping("/api/students")
-│       │          
-│       │          📍 CRUD Endpoints:
-│       │          ├─ GET    /api/students → getAllStudents()
-│       │          ├─ GET    /api/students/{id} → getStudentById(id)
-│       │          ├─ POST   /api/students → createStudent()
-│       │          ├─ PUT    /api/students/{id} → updateStudent()
-│       │          └─ DELETE /api/students/{id} → deleteStudent()
-│       │          
-│       │          🏥 Health Check Endpoints:
-│       │          ├─ GET    /api/students/health/status → trạng thái chi tiết
-│       │          ├─ GET    /api/students/health/ping → simple ping
-│       │          └─ GET    /api/students/health/detailed → detailed health + consistency
-│       │          
-│       │          🔧 Admin Endpoints:
-│       │          ├─ POST   /api/students/admin/sync → manual sync
-│       │          ├─ POST   /api/students/admin/reset-secondary → reset Railway
-│       │          ├─ GET    /api/students/admin/consistency-check → check dữ liệu
-│       │          └─ GET    /api/students/debug/db-info → debug info
-│       │          
-│       │          @CrossOrigin(origins = "*"): cho phép tất cả origins
-│       │
-│       └── util/
-│           └── DiagnosticService.java
-│               └── 🔍 CHẨN ĐOÁN:
-│                  - runFullDiagnostics(): report toàn diện
-│                  - testPrimaryDatabase(): kiểm tra Render
-│                  - testSecondaryDatabase(): kiểm tra Railway
-│                  - checkTableStatus(): kiểm tra table
-│                  - verifyData(): xác minh dữ liệu
-│                  - generateRecommendations(): gợi ý sửa lỗi
-│
-├── src/main/resources/
-│   ├── application.properties
-│   │   └── 🔐 CONFIG DATABASE + JPA:
-│   │      • spring.datasource.url (Render URL)
-│   │      • spring.datasource.username/password
-│   │      • secondary.datasource.* (Railway URL + credentials)
-│   │      • spring.jpa.show-sql=true (log SQL)
-│   │      • spring.jpa.hibernate.ddl-auto=update (auto create table)
-│   │      • logging.level.* (log levels)
-│   │      • server.port=8080
-│   │
-│   ├── application.yml (YAML alternative format)
-│   ├── static/ (CSS, JS static files)
-│   └── templates/ (Thymeleaf templates)
-│
-├── src/test/java/
-│   └── DemoApplicationTests.java
-│       └── 🧪 Unit tests (tạm thời empty)
-│
-├── pom.xml
-│   └── 📦 MAVEN CONFIG:
-│      • spring-boot-starter-web
-│      • spring-boot-starter-data-jpa
-│      • spring-boot-starter-validation
-│      • postgresql (JDBC driver)
-│      • lombok (code generator)
-│      • maven plugins (build, shade, etc.)
-│
 ├── Dockerfile
-│   └── 🐳 DOCKER BUILD:
-│      • Stage 1: maven:3.9-eclipse-temurin-17 (build)
-│      • Stage 2: eclipse-temurin:17-jre (runtime)
-│      • Expose port 8080
-│      • CMD: java -jar app.jar
-│
-├── mvnw & mvnw.cmd
-│   └── 📜 MAVEN WRAPPER:
-│      • Cho phép chạy Maven mà không cần cài globally
-│      • Linux/Mac: ./mvnw
-│      • Windows: .\mvnw.cmd
-│
-└── README.md
-    └── 📖 Tài liệu project này
+├── HELP.md
+├── README.md
+├── API_QUICK_REFERENCE.md
+├── DATABASE_MANAGEMENT.md
+├── TESTING_GUIDE.md
+├── application.yml
+├── mvnw
+├── mvnw.cmd
+├── pom.xml
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   │   └── com/example/demo/
+│   │   │       ├── DemoApplication.java
+│   │   │       └── studentbackend/
+│   │   │           ├── config/
+│   │   │           │   ├── CorsConfig.java
+│   │   │           │   ├── DataSourceConfig.java
+│   │   │           │   ├── DatabaseInitializer.java
+│   │   │           │   ├── JwtAuthFilter.java
+│   │   │           │   └── SecurityConfig.java
+│   │   │           ├── controller/
+│   │   │           │   ├── AdminController.java
+│   │   │           │   ├── GradeController.java
+│   │   │           │   ├── StudentController.java
+│   │   │           │   └── UserController.java
+│   │   │           ├── model/
+│   │   │           │   ├── Grade.java
+│   │   │           │   ├── Student.java
+│   │   │           │   └── User.java
+│   │   │           ├── repository/
+│   │   │           │   ├── GradeRepository.java
+│   │   │           │   ├── StudentRepository.java
+│   │   │           │   └── UserRepository.java
+│   │   │           ├── service/
+│   │   │           │   ├── GradeService.java
+│   │   │           │   ├── StudentService.java
+│   │   │           │   └── UserService.java
+│   │   │           └── util/
+│   │   │               ├── DatabaseResetService.java
+│   │   │               ├── DiagnosticService.java
+│   │   │               └── JwtUtil.java
+│   │   └── resources/
+│   │       ├── application.properties
+│   │       └── schema.sql
+│   └── test/
+│       └── java/com/example/demo/
+│           └── DemoApplicationTests.java
+└── target/
+    └── ... file build sinh ra bởi Maven
 ```
 
-### 📄 Chi tiết File quan trọng - Debugging Guide
-
-#### **1. `DemoApplication.java` 🚀 (Entry Point)**
-
-**Công dụng**: Khởi động toàn bộ Spring Boot application
-
-**Luồng khởi động**:
-```
-1. main() gọi SpringApplication.run()
-   ↓
-2. Spring Boot quét classpath, tìm @Configuration, @Component, @Service
-   ↓
-3. DataSourceConfig được load:
-   - Tạo Primary DataSource (Render PostgreSQL)
-   - Tạo Secondary DataSource (Railway PostgreSQL)
-   - Tạo ThreadPool cho @Async
-   ↓
-4. StudentService được load:
-   - @PostConstruct initializeSecondaryDb() chạy
-   - Tạo students table trên Railway
-   - Sync dữ liệu từ Render → Railway (async)
-   ↓
-5. StudentController được đăng ký:
-   - Các REST endpoints sẵn sàng
-   ↓
-6. Tomcat WebServer khởi động trên port 8080
-   ↓
-7. ✅ Application ready to accept requests
-```
-
-**Debug**: Nếu app không khởi động, kiểm tra logs:
-- `Check1`: Java version (`java -version` → phải Java 17+)
-- `Check2`: PostgreSQL driver có trong classpath không?
-- `Check3`: DataSourceConfig có được load không? (tìm logs: "Creating/verifying secondary table")
-
-**Chạy**:
-```bash
-./mvnw spring-boot:run              # Development
-java -jar target/demo*.jar          # Production
-```
-
----
-
-#### **2. `DataSourceConfig.java` ⚙️ (Configuration)**
-
-**Công dụng**: Cấu hình kết nối database (Primary + Secondary) + ThreadPool
-
-**Các Bean quan trọng**:
-
-| Bean Name | Dùng Cho | Mô Tả |
-|-----------|---------|-------|
-| `primaryDatasource` | Spring Data JPA | Kết nối Render PostgreSQL (Primary) |
-| `primaryJdbc` | Direct SQL queries | JdbcTemplate cho Render |
-| `secondaryDataSource` | Failover/Sync | Kết nối Railway PostgreSQL (Secondary) |
-| `secondaryJdbcTemplate` | Dual-write | JdbcTemplate cho Railway |
-| `taskExecutor` | @Async tasks | ThreadPool (2-5 threads, queue 100) |
-
-**Debug**:
-- Nếu Secondary DB không kết nối: kiểm tra `secondary.datasource.url`, username, password trong `application.properties`
-- Nếu threads không chạy: kiểm tra `@EnableAsync`, `@EnableScheduling` có được kích hoạt không?
-- Log: tìm "Creating/verifying secondary table" → nếu không có = DataSourceConfig chưa load
-
----
-
-#### **3. `Student.java` 📊 (Entity Model)**
-
-**Công dụng**: Ánh xạ Java Object ↔ SQL Table
-
-**Database Schema**:
-```sql
-CREATE TABLE students (
-    id BIGSERIAL PRIMARY KEY,      -- tự tăng
-    name VARCHAR(255),              -- Họ tên
-    email VARCHAR(255),             -- Email
-    phone VARCHAR(255),             -- Điện thoại
-    age INTEGER                      -- Tuổi
-);
-```
-
-**Annotations**:
-- `@Entity`: đánh dấu đây là JPA entity
-- `@Table(name="students")`: tên table trong DB
-- `@Id @GeneratedValue(IDENTITY)`: Primary Key, tự tăng
-- `@Data`: Lombok → auto generate getter/setter/toString
-
-**Debug**:
-- Nếu table không được tạo: kiểm tra `spring.jpa.hibernate.ddl-auto=update` trong `application.properties`
-- Nếu data lưu nhưng không có trong DB: kiểm tra transaction commit (xem logs)
-
----
-
-#### **4. `StudentRepository.java` 🏦 (Data Access Layer)**
-
-**Công dụng**: Giao tiếp với Primary Database (Render)
-
-**Methods tự động có**:
-```java
-findAll()              // SELECT * FROM students
-findById(Long id)      // SELECT * FROM students WHERE id = ?
-save(Student s)        // INSERT/UPDATE
-deleteById(Long id)    // DELETE FROM students WHERE id = ?
-count()                // SELECT COUNT(*) ...
-```
-
-**Debug**:
-- Nếu `save()` không lưu: check transaction (@Transactional)
-- Nếu `findAll()` trả về empty list: DB có data không?
-- Query logs: enable `logging.level.org.hibernate.SQL=DEBUG` trong `application.properties`
-
----
-
-#### **5. `StudentService.java` 🧠 (Business Logic - QUAN TRỌNG)**
-
-**Công dụng**: Xử lý:
-1. Dual-database writes (Render + Railway)
-2. Smart failover (Render down → fallback Railway)
-3. Automatic health checks (mỗi 5s)
-4. Data consistency checks
-
-**Các phần chính**:
-
-**A) Initialization (@PostConstruct)**:
-```java
-initializeSecondaryDb() 
-  ├─ Tạo students table trên Railway (CREATE TABLE IF NOT EXISTS)
-  └─ Sync dữ liệu từ Render → Railway (async)
-```
-
-**B) Health Checks (@Scheduled fixedDelay=5000)**:
-```java
-checkPrimaryDbHealth()
-  └─ Chạy "SELECT 1" trên Render → update primaryDbHealthy flag
-
-checkSecondaryDbHealth()
-  └─ Chạy "SELECT 1" trên Railway → update secondaryDbHealthy flag
-```
-
-**C) Read Operations**:
-```java
-getAllStudents()
-  ├─ Nếu primaryDbHealthy=true → đọc từ Render
-  └─ Nếu primaryDbHealthy=false → fallback Railway
-
-fallbackToSecondary(sql)
-  └─ Query trực tiếp Railway nếu Render down
-```
-
-**D) Write Operations**:
-```java
-createStudent(student)
-  ├─ Ghi vào Render (sync) → lấy ID
-  ├─ Verify data saved
-  └─ Ghi vào Railway (async) → không block request
-
-createStudentInSecondary(student)
-  └─ Failover: ghi vào Railway nếu Render down
-```
-
-**Debug - Logs cần nhìn**:
-```
-✅ Secondary table created/verified    → Railway table OK
-✅ Found X students in primary DB     → Sync thành công
-❌ Primary DB health check failed      → Render down!
-❌ Secondary DB write failed           → Railway down!
-⚠️  Primary DB read failed, falling back to secondary → Failover active
-```
-
----
-
-#### **6. `StudentController.java` 🎛️ (REST Endpoints)**
-
-**Công dụng**: Xử lý HTTP requests, định nghĩa REST API
-
-**CRUD Endpoints**:
-```
-GET    /api/students              → lấy all
-GET    /api/students/1            → lấy 1
-POST   /api/students              → thêm
-PUT    /api/students/1            → update
-DELETE /api/students/1            → xóa
-```
-
-**Health Endpoints**:
-```
-GET    /api/students/health/status          → trạng thái (UP/DOWN)
-GET    /api/students/health/ping            → simple check
-GET    /api/students/health/detailed        → status + consistency
-```
-
-**Admin Endpoints**:
-```
-POST   /api/students/admin/sync                      → manual sync
-POST   /api/students/admin/reset-secondary          → reset Railway
-GET    /api/students/admin/consistency-check        → verify data
-GET    /api/students/debug/db-info                  → debug info
-```
-
-**Debug - Test APIs**:
-```bash
-# Kiểm tra service chạy
-curl http://localhost:8080/api/students/health/ping
-
-# Xem trạng thái chi tiết
-curl http://localhost:8080/api/students/health/status
-
-# Xem debug info
-curl http://localhost:8080/api/students/debug/db-info
-
-# Xem danh sách sinh viên
-curl http://localhost:8080/api/students
-
-# Manual sync
-curl -X POST http://localhost:8080/api/students/admin/sync
-```
-
----
-
-#### **7. `application.properties` 🔐 (Configuration - QUAN TRỌNG)**
-
-**Công dụng**: Cấu hình database URLs, JPA settings, logging
-
-**Primary Database (Render)**:
-```properties
-spring.datasource.url=jdbc:postgresql://viaduct.proxy.rlwy.net:53388/railway?sslmode=require&TimeZone=UTC
-spring.datasource.username=postgres
-spring.datasource.password=UroOHCbEVypYZtJsLuhApYbpXRHgBeen
-```
-
-**Secondary Database (Railway)**:
-```properties
-secondary.datasource.url=jdbc:postgresql://ep-lively-mode-ao1u72zd-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&TimeZone=UTC
-secondary.datasource.username=neondb_owner
-secondary.datasource.password=npg_jJTmrv56Qyid
-```
-
-**JPA Settings**:
-```properties
-spring.jpa.show-sql=true                                    # Log SQL queries
-spring.jpa.hibernate.ddl-auto=update                        # Auto create/update table
-spring.jpa.properties.hibernate.dialect=org.hibernate.dialect.PostgreSQLDialect
-```
-
-**Logging**:
-```properties
-logging.level.root=INFO
-logging.level.com.example.demo=DEBUG                        # App logs (DEBUG)
-logging.level.org.hibernate.SQL=DEBUG                       # SQL logs
-```
-
-**Debug**:
-- Nếu database connection fail: kiểm tra URL, username, password
-- Nếu table không tạo: kiểm tra `spring.jpa.hibernate.ddl-auto=update`
-- Để xem SQL queries: bật `logging.level.org.hibernate.SQL=DEBUG`
-
----
-
-#### **8. `pom.xml` 📦 (Maven Dependencies)**
-
-**Công dụng**: Quản lý dependencies và build config
-
-**Main Dependencies**:
-```xml
-spring-boot-starter-web              <!-- Web MVC, REST -->
-spring-boot-starter-data-jpa         <!-- JPA, Hibernate -->
-spring-boot-starter-actuator         <!-- Health checks -->
-postgresql                           <!-- PostgreSQL JDBC driver -->
-lombok                               <!-- Code generation -->
-```
-
-**Debug**:
-- Nếu build fail: kiểm tra Java version (phải 17+)
-- Nếu missing dependency: chạy `./mvnw clean compile`
-- POM errors: xem logs chi tiết từ `mvnw`
-
----
-
-#### **9. `Dockerfile` 🐳 (Docker Container)**
-
-**Công dụng**: Build image để deploy lên cloud
-
-**Build Process**:
-```dockerfile
-Stage 1 (Builder):
-  - Base: maven:3.9-eclipse-temurin-17
-  - COPY source code
-  - Run: mvn clean package
-  - Output: target/demo-0.0.1-SNAPSHOT.jar
-
-Stage 2 (Runtime):
-  - Base: eclipse-temurin:17-jre (nhẹ hơn)
-  - COPY JAR từ Stage 1
-  - EXPOSE 8080
-  - CMD: java -jar app.jar
-```
-
-**Debug**:
-- Nếu Docker build fail: kiểm tra internet (maven download slow)
-- Image size quá lớn: dùng multi-stage build (đã được tối ưu)
-
----
-
-#### **10. `DiagnosticService.java` 🔍 (Diagnostics - Advanced)**
-
-**Công dụng**: Chẩn đoán toàn diện hệ thống
-
-**Methods**:
-```java
-runFullDiagnostics()      // Report toàn diện
-testPrimaryDatabase()      // Kiểm tra Render
-testSecondaryDatabase()    // Kiểm tra Railway
-checkTableStatus()         // Kiểm tra table structure
-verifyData()               // So sánh dữ liệu 2 DB
-generateRecommendations()  // Gợi ý sửa lỗi
-```
-
-**Sử dụng**: Tìm endpoint nào gọi DiagnosticService trong StudentController
-
----
-
-#### **11. `CorsConfig.java` 🔧 (CORS Configuration)**
-
-**Công dụng**: Cho phép frontend từ any domain gọi API
-
-**Cấu hình**:
-```java
-allowedOrigins("*")                  // Mọi domain
-allowedMethods("GET", "POST", ...)   // Các HTTP methods
-maxAge(3600)                          // Cache 1 giờ
-```
-
-**Debug**:
-- Nếu frontend CORS error: check CorsConfig + @CrossOrigin annotations
-
----
-
-## 🚀 Phần 3: Chạy Backend Locally và Deploy lên Cloud qua GitHub
-
-### 📌 Yêu cầu hệ thống
-
-Để chạy backend locally, bạn cần:
-- **Java 17+**: `java -version`
-- **Maven** (hoặc dùng `mvnw` - Maven wrapper đã kèm theo project)
-- **PostgreSQL** (hoặc dùng Render/Railway connection string) - ✅ Không cần cài local nếu dùng cloud DB
-
-### 🖥️ Chạy Backend Locally
-
-#### **Step 1: Configure Database (Optional - nếu muốn test local)**
-
-Nếu muốn test với local PostgreSQL:
-1. Cài PostgreSQL
-2. Tạo database: `createdb student_db`
-3. Update `application.properties`:
-   ```properties
-   # Local PostgreSQL
-   spring.datasource.url=jdbc:postgresql://localhost:5432/student_db?sslmode=disable
-   spring.datasource.username=postgres
-   spring.datasource.password=your_local_password
-   
-   # Secondary (có thể trỏ sang local khác port hoặc comment out)
-   secondary.datasource.url=...
-   ```
-
-**Hoặc** (Dễ hơn) - Dùng cloud database URLs trực tiếp:
-- Bỏ qua bước này, `application.properties` đã có Render + Railway URLs
-
-#### **Step 2: Clone Repository từ GitHub**
+## Công dụng từng nhóm file
+
+### File gốc dự án
+
+| File | Công dụng |
+| --- | --- |
+| `pom.xml` | Khai báo dependency Maven, Java 17, Spring Boot plugin, cấu hình build JAR. |
+| `mvnw`, `mvnw.cmd` | Maven Wrapper, dùng để chạy Maven mà không cần cài Maven global. |
+| `Dockerfile` | Build Docker image theo 2 stage: build bằng JDK 17, chạy bằng JRE 17. |
+| `application.yml` | File cấu hình mẫu theo YAML cho dual database và profile dev/prod. Code hiện tại chủ yếu đọc từ `application.properties`. |
+| `API_QUICK_REFERENCE.md` | Tài liệu tham khảo nhanh API. |
+| `DATABASE_MANAGEMENT.md` | Ghi chú quản lý/reset database. |
+| `TESTING_GUIDE.md` | Hướng dẫn test API và backend. |
+| `HELP.md` | Tài liệu trợ giúp sinh bởi Spring Initializr. |
+| `target/` | Thư mục build output, chứa class đã compile và file JAR. Không cần sửa thủ công. |
+
+### Entry point
+
+| File | Công dụng |
+| --- | --- |
+| `DemoApplication.java` | Hàm `main`, khởi động Spring Boot, quét bean, mở embedded Tomcat. |
+
+### `config/`
+
+| File | Công dụng |
+| --- | --- |
+| `DataSourceConfig.java` | Tạo primary datasource, secondary datasource, `JdbcTemplate`, bật async, scheduling và transaction management. |
+| `DatabaseInitializer.java` | Khi app khởi động, tạo các bảng `students`, `users`, `grades` nếu chưa tồn tại ở cả primary và secondary database. |
+| `SecurityConfig.java` | Cấu hình Spring Security, JWT stateless, endpoint public/protected, password encoder BCrypt và CORS. |
+| `JwtAuthFilter.java` | Đọc header `Authorization: Bearer <token>`, validate JWT và set authentication vào `SecurityContext`. |
+| `CorsConfig.java` | Cấu hình CORS global để frontend có thể gọi API. |
+
+### `model/`
+
+| File | Công dụng |
+| --- | --- |
+| `Student.java` | Entity bảng `students`: `id`, `name`, `email`, `phone`, `age`. |
+| `Grade.java` | Entity bảng `grades`: điểm toán, văn, anh, điểm trung bình `total`, thời gian tạo/cập nhật. |
+| `User.java` | Entity bảng `users`: `username`, password đã hash, role, thời gian tạo. |
+
+### `repository/`
+
+| File | Công dụng |
+| --- | --- |
+| `StudentRepository.java` | Repository JPA cho CRUD sinh viên. |
+| `GradeRepository.java` | Repository JPA cho điểm số, có thêm `findByStudentId` và `deleteByStudentId`. |
+| `UserRepository.java` | Repository JPA cho tài khoản, có `findByUsername` để login/register. |
+
+### `service/`
+
+| File | Công dụng |
+| --- | --- |
+| `StudentService.java` | Business logic sinh viên: CRUD, health check, fallback sang secondary DB, đồng bộ dữ liệu sang secondary DB, kiểm tra consistency. |
+| `GradeService.java` | Business logic điểm số: CRUD, validate điểm 0-10, tính `total`, đồng bộ điểm sang secondary DB. |
+| `UserService.java` | Business logic đăng ký/đăng nhập: hash password, kiểm tra password, tạo JWT, đồng bộ user sang secondary DB. |
+
+### `controller/`
+
+| File | Công dụng |
+| --- | --- |
+| `StudentController.java` | REST API `/api/students`: CRUD sinh viên, health, debug, sync dữ liệu sinh viên. |
+| `GradeController.java` | REST API `/api/grades`: CRUD điểm số, yêu cầu JWT. |
+| `UserController.java` | REST API `/api/auth`: đăng ký, đăng nhập, health auth. |
+| `AdminController.java` | REST API `/api/admin`: reset dữ liệu, kiểm tra auto-increment, failover, thống kê database. |
+
+### `util/`
+
+| File | Công dụng |
+| --- | --- |
+| `JwtUtil.java` | Tạo JWT, validate JWT, lấy username từ token. |
+| `DiagnosticService.java` | Chẩn đoán kết nối database, kiểm tra bảng, kiểm tra dữ liệu và health primary/secondary. |
+| `DatabaseResetService.java` | Xóa dữ liệu các bảng ở primary/secondary, reset sequence, kiểm tra số lượng bản ghi. |
+
+### `resources/`
+
+| File | Công dụng |
+| --- | --- |
+| `application.properties` | Cấu hình chính của app: datasource, JPA, logging, port, JWT secret. |
+| `schema.sql` | SQL tạo bảng `students`, `users`, `grades` và index. Hiện `spring.sql.init` đang bị comment nên file này không tự chạy mặc định. |
+
+### Test
+
+| File | Công dụng |
+| --- | --- |
+| `DemoApplicationTests.java` | Test mặc định `contextLoads()` để kiểm tra Spring context khởi động được. |
+
+## Luồng hoạt động chính
+
+1. App khởi động từ `DemoApplication.java`.
+2. `DataSourceConfig` tạo kết nối primary và secondary database.
+3. `DatabaseInitializer` tạo bảng nếu chưa có.
+4. `StudentService` và `GradeService` tạo bảng secondary nếu cần và bắt đầu sync dữ liệu nền.
+5. Client gọi API qua controller.
+6. Service xử lý nghiệp vụ, ghi primary trước, sau đó ghi/sync secondary.
+7. Spring Security dùng `JwtAuthFilter` để bảo vệ các endpoint cần đăng nhập.
+
+## API chính
+
+### Auth
+
+| Method | Endpoint | Công dụng | Auth |
+| --- | --- | --- | --- |
+| `POST` | `/api/auth/register` | Đăng ký user mới | Không |
+| `POST` | `/api/auth/login` | Đăng nhập, trả JWT token | Không |
+| `GET` | `/api/auth/health` | Kiểm tra auth service | Không |
+
+Ví dụ đăng ký:
 
 ```bash
-# Clone project
-git clone https://github.com/YOUR_USERNAME/DTDM.git
-cd DTDM/demo
-
-# Xem branch hiện tại
-git status
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123","role":"ADMIN"}'
 ```
 
-#### **Step 3: Build Project**
+Ví dụ đăng nhập:
 
 ```bash
-# Option 1: Dùng Maven wrapper (recommended - không cần cài Maven)
-./mvnw clean package          # Windows: .\mvnw.cmd clean package
-
-# Option 2: Dùng Maven (cần cài Maven trước)
-mvn clean package
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
 ```
 
-**Output**: `target/demo-0.0.1-SNAPSHOT.jar` ✅
+### Students
 
-#### **Step 4: Chạy Backend**
+| Method | Endpoint | Công dụng | Auth |
+| --- | --- | --- | --- |
+| `GET` | `/api/students` | Lấy danh sách sinh viên | Không |
+| `GET` | `/api/students/{id}` | Lấy sinh viên theo id | Có |
+| `POST` | `/api/students` | Thêm sinh viên | Có |
+| `PUT` | `/api/students/{id}` | Cập nhật sinh viên | Có |
+| `DELETE` | `/api/students/{id}` | Xóa sinh viên | Có |
+| `GET` | `/api/students/health/status` | Health status | Không |
+| `GET` | `/api/students/health/detailed` | Health + consistency | Không |
+| `GET` | `/api/students/debug/diagnostics` | Diagnostic đầy đủ | Không |
+| `POST` | `/api/students/admin/sync` | Sync sinh viên thủ công | Tùy cấu hình security hiện tại |
+
+Ví dụ thêm sinh viên:
 
 ```bash
-# Cách 1: Chạy trực tiếp từ Spring Boot
-./mvnw spring-boot:run        # Windows: .\mvnw.cmd spring-boot:run
-
-# Cách 2: Chạy từ JAR đã build
-java -jar target/demo-0.0.1-SNAPSHOT.jar
-
-# Cách 3: Chạy với environment variables (cho cloud URLs)
-SET SPRING_DATASOURCE_URL=jdbc:postgresql://render-url/db  # Windows
-export SPRING_DATASOURCE_URL="..."                          # Linux/Mac
-```
-
-**Output**:
-```
-  ╔═════════════════════════════════════╗
-  ║   Demo Application Started         ║
-  ╚═════════════════════════════════════╝
-  
-Tomcat started on port: 8080 ✅
-```
-
-#### **Step 5: Test Backend Locally**
-
-```bash
-# Lấy danh sách sinh viên
-curl http://localhost:8080/api/students
-
-# Thêm sinh viên mới
 curl -X POST http://localhost:8080/api/students \
   -H "Content-Type: application/json" \
-  -d '{"name":"Nguyễn Văn A","email":"a@test.com","phone":"0123456789","age":20}'
-
-# Health check
-curl http://localhost:8080/api/students/health/status
-
-# View ở browser
-Open: http://localhost:8080/api/students
+  -H "Authorization: Bearer <TOKEN>" \
+  -d '{"name":"Nguyen Van A","email":"a@example.com","phone":"0123456789","age":20}'
 ```
 
----
+### Grades
 
-### 🌐 Deploy lên Cloud (Render / Railway) qua GitHub
+Tất cả endpoint `/api/grades/**` yêu cầu JWT.
 
-#### **Step 1: Prepare GitHub Repository**
+| Method | Endpoint | Công dụng |
+| --- | --- | --- |
+| `GET` | `/api/grades` | Lấy tất cả điểm |
+| `GET` | `/api/grades/{id}` | Lấy điểm theo id |
+| `GET` | `/api/grades/student/{studentId}` | Lấy điểm theo sinh viên |
+| `POST` | `/api/grades` | Tạo điểm mới |
+| `PUT` | `/api/grades/{id}` | Cập nhật điểm |
+| `DELETE` | `/api/grades/{id}` | Xóa điểm |
+| `POST` | `/api/grades/admin/sync` | Sync điểm sang secondary |
+| `POST` | `/api/grades/admin/reset-secondary` | Reset bảng điểm ở secondary rồi sync lại |
+
+Ví dụ tạo điểm:
 
 ```bash
-# 1.1: Initialize git (nếu chưa có)
-cd d:\VS\DTDM
-git init
-git add .
-git commit -m "Initial commit: Student Backend with dual-database"
-
-# 1.2: Add remote (thay YOUR_USERNAME, REPO_NAME)
-git remote add origin https://github.com/YOUR_USERNAME/DTDM.git
-
-# 1.3: Push lên GitHub
-git branch -M main
-git push -u origin main
+curl -X POST http://localhost:8080/api/grades \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <TOKEN>" \
+  -d '{"studentId":1,"math":8.5,"literature":9.0,"english":7.5}'
 ```
 
-✅ **GitHub Repository ready!**
+### Admin
 
----
+| Method | Endpoint | Công dụng |
+| --- | --- | --- |
+| `POST` | `/api/admin/reset-all` | Xóa dữ liệu ở cả 2 DB và reset sequence |
+| `POST` | `/api/admin/reset-primary` | Xóa dữ liệu primary DB |
+| `POST` | `/api/admin/reset-secondary` | Xóa dữ liệu secondary DB |
+| `GET` | `/api/admin/verify-autoincrement` | Kiểm tra sequence auto-increment |
+| `GET` | `/api/admin/check-failover` | Kiểm tra trạng thái primary/secondary |
+| `GET` | `/api/admin/database-stats` | Kiểm tra thống kê dữ liệu |
 
-#### **Step 2: Deploy lên Render (Primary Database)**
+Lưu ý: các endpoint admin hiện đang được permit public trong `SecurityConfig`. Nếu deploy thật, nên bảo vệ bằng quyền admin/JWT.
 
-##### **2.1: Tạo PostgreSQL Database trên Render**
+## Cấu hình database
 
-1. Đăng nhập [render.com](https://render.com)
-2. Dashboard → **New** → **PostgreSQL**
-3. Điền thông tin:
-   - **Name**: `student-db`
-   - **Region**: Singapore (gần hơn)
-   - **PostgreSQL Version**: 16
-   - Để default khác
-4. Click **Create Database**
-5. **Copy connection string**:
-   - URL format: `postgresql://user:password@host:port/dbname?sslmode=require`
-   - **Save lại** cho Step 2.3
+File cấu hình chính:
 
-##### **2.2: Deploy Spring Boot Backend lên Render**
+```text
+src/main/resources/application.properties
+```
 
-1. Dashboard → **New** → **Web Service**
-2. Kết nối GitHub:
-   - **Connect account** → GitHub
-   - **Select repository** → `DTDM`
-   - **Branch**: `main`
-3. Điền thông tin:
-   - **Name**: `student-backend`
-   - **Environment**: `Docker` (Render sẽ dùng Dockerfile)
-   - **Region**: Singapore
-   - **Pricing**: Free tier (tạm được)
-4. **Advanced**:
-   - **Auto-deploy**: ✅ Enable (mỗi push đến main → auto deploy)
-5. Click **Create Web Service** → Render tự build & deploy
-6. **Wait** ~2-3 phút → Backend link sẵn sàng
+Các key quan trọng:
 
-##### **2.3: Cấu hình Environment Variables (Quan trọng!)**
-
-Sau khi service được tạo:
-1. Vào **Settings** → **Environment**
-2. Thêm biến:
-   ```
-   SPRING_DATASOURCE_URL = postgresql://user:password@host:port/dbname?sslmode=require
-   SPRING_DATASOURCE_USERNAME = user
-   SPRING_DATASOURCE_PASSWORD = password
-   SPRING_DATASOURCE_DRIVER_CLASS_NAME = org.postgresql.Driver
-   ```
-3. Click **Save** → Auto redeploy với biến mới
-
-⚠️ **HOẶC** Update `application.properties` cục bộ → commit → push:
 ```properties
-spring.datasource.url=${SPRING_DATASOURCE_URL}  # Environment variable
-spring.datasource.username=${SPRING_DATASOURCE_USERNAME}
-spring.datasource.password=${SPRING_DATASOURCE_PASSWORD}
+spring.datasource.url=...
+spring.datasource.username=...
+spring.datasource.password=...
+
+secondary.datasource.url=...
+secondary.datasource.username=...
+secondary.datasource.password=...
+
+server.port=${PORT:8080}
+jwt.secret=...
+jwt.expiration=86400000
 ```
 
----
+Lưu ý bảo mật: không nên commit password database và JWT secret thật lên GitHub. Khi deploy, nên chuyển sang environment variables.
 
-#### **Step 3: Deploy Secondary Database lên Railway**
+## Cách chạy chương trình
 
-##### **3.1: Tạo PostgreSQL trên Railway**
+### Yêu cầu
 
-1. Đăng nhập [railway.app](https://railway.app)
-2. **New Project** → **Deploy from GitHub** → Chọn DTDM repo
-3. **Add PostgreSQL plugin**:
-   - Railway → **Plugins** → **Add** → **PostgreSQL**
-4. **Get connection string**:
-   - Plugin → **PostgreSQL** → **Logs** → Copy connection URL
-   - Format: `postgresql://user:password@host:port/db`
+- Java 17 trở lên
+- Có kết nối tới PostgreSQL primary và secondary trong `application.properties`
+- Windows dùng `mvnw.cmd`, Linux/macOS dùng `./mvnw`
 
-##### **3.2: Update Secondary Datasource**
-
-Update `application.properties`:
-```properties
-# Secondary DB (Railway)
-secondary.datasource.url=postgresql://user:password@railway.host:port/railway?sslmode=require
-secondary.datasource.username=user
-secondary.datasource.password=password
-```
-
-**Commit & Push**:
-```bash
-git add application.properties
-git commit -m "Configure Railway secondary database"
-git push origin main
-```
-
-✅ Render sẽ auto-redeploy với config mới!
-
----
-
-#### **Step 4: Verify Cloud Deployment**
-
-Kiểm tra backend chạy trên cloud:
+Kiểm tra Java:
 
 ```bash
-# Test API (thay YOUR_RENDER_URL)
-curl https://student-backend-xxx.onrender.com/api/students
-
-# Health check
-curl https://student-backend-xxx.onrender.com/api/students/health/status
-
-# Debug info
-curl https://student-backend-xxx.onrender.com/api/students/debug/db-info
+java -version
 ```
 
-**Expected Response**:
-```json
-{
-  "status": "UP",
-  "timestamp": 1712500000000,
-  "service": "StudentService"
-}
+### Chạy bằng Maven Wrapper
+
+Trên Windows PowerShell:
+
+```powershell
+cd D:\VS\DTDM\demo
+.\mvnw.cmd spring-boot:run
 ```
 
-✅ **Backend running on cloud!**
-
----
-
-### 📋 Workflow Update Code & Redeploy
-
-Mỗi khi bạn thay đổi code:
+Trên Linux/macOS:
 
 ```bash
-# 1. Edit code locally
-# 2. Build & test local
-./mvnw clean package
+cd demo
 ./mvnw spring-boot:run
-
-# 3. Commit & push GitHub
-git add .
-git commit -m "Update: [describe changes]"
-git push origin main
-
-# 4. Auto-deploy (Render)
-# ✅ Render detects push → Auto rebuild & deploy (2-3 phút)
-# ✅ Railway detects push → Auto rebuild & deploy
-
-# 5. Verify
-curl https://student-backend-xxx.onrender.com/api/students
 ```
 
----
+Mặc định API chạy ở:
 
-### 🔧 Troubleshooting
+```text
+http://localhost:8080
+```
 
-| Vấn đề | Giải pháp |
-|--------|----------|
-| **Build fail trên Render** | Kiểm tra logs: Render dashboard → Logs tab; Thường là Java version hoặc dependency issue |
-| **Database connection fail** | Check `application.properties` → Database URL, username, password phải đúng; Verify SSL mode |
-| **Port conflict local (8080)** | `./mvnw spring-boot:run -Dserver.port=8081` |
-| **Git push fail** | `git pull origin main` trước, resolve conflicts, rồi push lại |
-| **Secondary DB không sync** | Đủ RAM/CPU không? Render/Railway quota hết không? Kiểm tra `POST /api/students/admin/sync` |
-
----
-
-### 📚 Lệnh hữu dụng
+Health check:
 
 ```bash
-# Build
-./mvnw clean package              # Build JAR
-./mvnw clean compile             # Chỉ compile (không build JAR)
+curl http://localhost:8080/api/students/health/ping
+```
 
-# Run local
-./mvnw spring-boot:run           # Development mode
-java -jar target/demo*.jar       # Production mode
+### Build JAR
 
-# Test
-./mvnw test                      # Run unit tests
-curl http://localhost:8080/api/students  # Manual test API
+Windows:
 
-# Docker (tùy chọn - nếu chạy local)
+```powershell
+cd D:\VS\DTDM\demo
+.\mvnw.cmd clean package
+java -jar target\demo-0.0.1-SNAPSHOT.jar
+```
+
+Linux/macOS:
+
+```bash
+cd demo
+./mvnw clean package
+java -jar target/demo-0.0.1-SNAPSHOT.jar
+```
+
+### Chạy test
+
+```bash
+./mvnw test
+```
+
+Windows:
+
+```powershell
+.\mvnw.cmd test
+```
+
+### Chạy bằng Docker
+
+Build image:
+
+```bash
 docker build -t student-backend .
-docker run -p 8080:8080 -e SPRING_DATASOURCE_URL=... student-backend
-
-# Git
-git status                        # Check status
-git add .                        # Stage changes
-git commit -m "..."              # Commit
-git push origin main             # Push to GitHub
 ```
 
----
+Run container:
 
-## 💾 Database Schema (PostgreSQL)
-
-```sql
-CREATE TABLE students (
-    id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE,
-    phone VARCHAR(20),
-    age INTEGER
-);
+```bash
+docker run -p 8080:8080 student-backend
 ```
 
-**Auto-tạo**: Spring Boot tự động tạo bảng khi `spring.jpa.hibernate.ddl-auto=update` ✅
+Nếu cần truyền biến môi trường:
 
----
-
-## ✅ Checklist Deployment
-
-- [ ] code pushed to GitHub
-- [ ] Render PostgreSQL database created
-- [ ] Render Web Service created + configured
-- [ ] Environment variables set on Render
-- [ ] Railway PostgreSQL created (backup)
-- [ ] Secondary datasource configured
-- [ ] Health check endpoint responding: `/api/students/health/status`
-- [ ] CRUD operations tested
-- [ ] Frontend connected to backend URL
-
----
-
-**Status**: 🟢 Backend Production Ready on Cloud!
-
-Cho bất kỳ câu hỏi, xem logs trên **Render Dashboard** hoặc **Railway Dashboard**.
-
-
-- **Spring Boot 3.5.11**
-- **Spring Data JPA**
-- **PostgreSQL** (Render + Railway)
-- **Lombok**
-- **Maven**
-
-## 📖 Hướng dẫn chi tiết
-
-### Cách hoạt động
-
-1. **Khởi động**:
-   - Spring Boot tự động cấu hình Primary DB (Render) từ `spring.datasource.*`
-   - `DataSourceConfig` tạo Secondary DB (Railway) từ `secondary.datasource.*`
-   - `StudentService` tự động sync dữ liệu từ Render sang Railway (async)
-
-2. **Đọc dữ liệu**:
-   - Ưu tiên đọc từ Render (Primary)
-   - Nếu Render down → tự động fallback sang Railway
-   - Health check mỗi 5 giây để phát hiện sự cố
-
-3. **Ghi dữ liệu**:
-   - Luôn ghi vào Render trước (Primary)
-   - Async ghi vào Railway (Secondary)
-   - Nếu Railway fail → không ảnh hưởng request, data sẽ sync sau
-
-### Lưu ý quan trọng
-
-- **Timezone**: Phải set `TimeZone=UTC` trong connection URL hoặc JVM argument để tránh lỗi với PostgreSQL
-- **Không commit** thông tin database lên GitHub
-- Luôn sử dụng environment variables khi deploy
-- Railway free tier có giới hạn (500 hours/tháng, 1GB storage)
-
-## 🔍 Monitoring & Logs
-
-### ✅ Logs bình thường khi ứng dụng chạy:
-```
-[main] INFO  o.s.b.w.e.tomcat.TomcatWebServer - Tomcat started on port 8080
-[main] INFO  com.example.demo.DemoApplication - Started DemoApplication in X seconds
-[main] INFO  c.e.d.s.service.StudentService - Found X students in primary DB
-[main] INFO  c.e.d.s.service.StudentService - Sync completed successfully
-[scheduling-1] DEBUG c.e.d.s.service.StudentService - Primary DB is healthy
-[scheduling-1] DEBUG c.e.d.s.service.StudentService - Secondary DB is healthy
+```bash
+docker run -p 8080:8080 \
+  -e SPRING_DATASOURCE_URL="jdbc:postgresql://host:5432/db" \
+  -e SPRING_DATASOURCE_USERNAME="postgres" \
+  -e SPRING_DATASOURCE_PASSWORD="password" \
+  student-backend
 ```
 
-### ⚠️ Warning cần xử lý:
-```
-WARN  o.s.b.a.o.j.JpaBaseConfiguration$JpaWebConfiguration - 
-spring.jpa.open-in-view is enabled by default. 
-Therefore, database queries may be performed during view rendering. 
-Explicitly configure spring.jpa.open-in-view to disable this warning
-```
+## Ghi chú khi phát triển
 
-**Cách fix**: Thêm vào `application.properties`:
-```properties
-spring.jpa.open-in-view=false
-```
-
-**Giải thích**: Cài đặt này tắt auto-opening của Hibernate session trong view layer, 
-tránh lazy-loading issues và cải thiện performance.
-
-### 📊 Logs theo dõi khác:
-- `✅ Secondary table created/verified` - Railway table đã được tạo
-- `✅ Found X students in primary DB` - Sync dữ liệu thành công
-- `✅ Primary DB is healthy` - Render DB hoạt động tốt
-- `⚠️ Primary DB health check failed` - Render DB có vấn đề
-- `⚠️ Secondary DB write failed` - Railway write fail (sẽ sync sau)
-
-### 🔗 Health endpoints:
-- `GET /api/students/health/status` - Trạng thái chi tiết
-- `GET /api/students/health/ping` - Simple ping check
-- `POST /api/students/admin/sync` - Manual sync (emergency)
-
-## 📄 License
-
-MIT License
-
----
-
-**Developed with ❤️ using Spring Boot**
+- `target/` là thư mục sinh ra sau khi build, không sửa trực tiếp.
+- `schema.sql` có lệnh `DROP TABLE`, chỉ dùng cẩn thận trong môi trường test.
+- `spring.jpa.hibernate.ddl-auto=validate` nghĩa là Hibernate chỉ kiểm tra schema, không tự sửa bảng.
+- `DatabaseInitializer` mới là phần đang tạo bảng nếu chưa tồn tại.
+- Secondary DB có thể lỗi mà app vẫn chạy, nhưng một số chức năng sync/failover sẽ bị ảnh hưởng.
+- Endpoint `/api/grades/**` cần token JWT trong header `Authorization: Bearer <TOKEN>`.

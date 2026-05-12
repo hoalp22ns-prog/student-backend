@@ -2,19 +2,17 @@ package com.example.demo.studentbackend.service;
 
 import com.example.demo.studentbackend.model.Student;
 import com.example.demo.studentbackend.repository.StudentRepository;
+import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.scheduling.annotation.Scheduled;
-import jakarta.annotation.PostConstruct;
-import org.springframework.dao.DataAccessException;
-import org.springframework.jdbc.CannotGetJdbcConnectionException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import javax.sql.DataSource;
 import java.util.*;
@@ -28,167 +26,114 @@ public class StudentService {
     private StudentRepository studentRepository;
 
     private final JdbcTemplate secondaryJdbc;
-    
-    // ✅ Add primary JdbcTemplate for direct SQL queries
     private JdbcTemplate primaryJdbc;
-    
+
+    @Value("${app.primary.enabled:true}")
+    private boolean primaryEnabled;
+
+    @Value("${spring.datasource.url:}")
+    private String primaryUrl;
+
+    @Value("${app.secondary.enabled:true}")
+    private boolean secondaryEnabled;
+
+    private final AtomicBoolean primaryDbHealthy = new AtomicBoolean(false);
+    private final AtomicBoolean secondaryDbHealthy = new AtomicBoolean(true);
+    private final AtomicBoolean syncInProgress = new AtomicBoolean(false);
+    private final AtomicBoolean reverseSyncInProgress = new AtomicBoolean(false);
+    private final AtomicBoolean primaryWasDown = new AtomicBoolean(false);
+
     @Autowired
     public void setPrimaryDataSource(DataSource primaryDataSource) {
         this.primaryJdbc = new JdbcTemplate(primaryDataSource);
     }
-    
-    // ✅ Track health của Render DB
-    private final AtomicBoolean primaryDbHealthy = new AtomicBoolean(true);
-    // ✅ NEW: Track secondary health separately
-    private final AtomicBoolean secondaryDbHealthy = new AtomicBoolean(true);
-    
-    // ✅ Track sync status
-    private final AtomicBoolean syncInProgress = new AtomicBoolean(false);
-
-    @Value("${app.secondary.enabled:true}")
-    private boolean secondaryEnabled;
-    
-    // ✅ NEW: Retry configuration
-    private static final int MAX_RETRIES = 3;
-    private static final int INITIAL_RETRY_DELAY_MS = 500;
 
     public StudentService(@Qualifier("secondaryDataSource") DataSource secondaryDataSource) {
         this.secondaryJdbc = new JdbcTemplate(secondaryDataSource);
     }
 
-    // ============================================
-    // ✅ FIX 1: Sequential Initialization (Race condition fix)
-    // ============================================
-
     @PostConstruct
-    public void initializeSecondaryDb() {
-        log.info("🔄 Initializing secondary database...");
-        initializeSecondaryDbAsync();  // Single async method that does both
+    public void init() {
+        boolean configured = isPrimaryConfigured();
+        primaryDbHealthy.set(configured);
+        primaryWasDown.set(!configured);
+        initializeSecondaryDb();
     }
 
     @Async
-    private void initializeSecondaryDbAsync() {
-        // Step 1: Create table (required before sync)
+    public void initializeSecondaryDb() {
         try {
-            log.debug("📝 Creating/verifying secondary table...");
             secondaryJdbc.execute("""
                 CREATE TABLE IF NOT EXISTS students (
                     id BIGSERIAL PRIMARY KEY,
                     name VARCHAR(255),
                     email VARCHAR(255),
                     phone VARCHAR(255),
-                    age INTEGER
+                    age INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """);
-            log.info("✅ Secondary table created/verified");
-            
-            // Verify table exists
-            Integer count = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
-            log.info("✅ Secondary table verified - current record count: {}", count);
             secondaryDbHealthy.set(true);
         } catch (Exception e) {
-            log.error("❌ Failed to create secondary table: {}", e.getMessage(), e);
             secondaryDbHealthy.set(false);
-            return;  // ⚠️ Stop sync if table creation failed
+            log.warn("Cannot initialize secondary students table: {}", e.getMessage());
         }
-
-        // Step 2: Sync data (only after table is ready)
-        syncToSecondaryAsync();
     }
 
-    // ============================================
-    // ✅ HEALTH CHECK with Timeout Fix
-    // ============================================
-
     @Scheduled(fixedDelay = 5000)
-    @Transactional(timeout = 2)  // 2 second timeout
     public void checkPrimaryDbHealth() {
+        if (!isPrimaryConfigured()) {
+            primaryDbHealthy.set(false);
+            primaryWasDown.set(true);
+            return;
+        }
+
         try {
-            // Use simple query (faster than count on large tables)
             Integer result = primaryJdbc.queryForObject("SELECT 1", Integer.class);
             if (result != null) {
+                boolean recovered = primaryWasDown.getAndSet(false);
                 primaryDbHealthy.set(true);
-                log.debug("✅ Primary DB is healthy");
+
+                if (recovered) {
+                    log.warn("Primary DB recovered. Start reverse sync students secondary -> primary.");
+                    syncFromSecondaryToPrimaryAsync();
+                }
             }
         } catch (Exception e) {
             primaryDbHealthy.set(false);
-            log.warn("❌ Primary DB health check failed: {}", e.getClass().getSimpleName());
+            primaryWasDown.set(true);
+            log.warn("Primary DB is down: {}", e.getClass().getSimpleName());
         }
     }
 
     @Scheduled(fixedDelay = 5000)
-    @Transactional(timeout = 2)
     public void checkSecondaryDbHealth() {
-        if (!secondaryEnabled) return;
+        if (!secondaryEnabled) {
+            secondaryDbHealthy.set(false);
+            return;
+        }
 
         try {
             Integer result = secondaryJdbc.queryForObject("SELECT 1", Integer.class);
-            if (result != null) {
-                secondaryDbHealthy.set(true);
-                log.debug("✅ Secondary DB is healthy");
-            }
+            secondaryDbHealthy.set(result != null);
         } catch (Exception e) {
             secondaryDbHealthy.set(false);
-            log.warn("❌ Secondary DB health check failed: {}", e.getClass().getSimpleName());
+            log.warn("Secondary DB is down: {}", e.getClass().getSimpleName());
         }
     }
 
-    // ============================================
-    // ✅ READ OPERATIONS - Smart Routing
-    // ============================================
-
-    /**
-     * ✅ Đọc với smart fallover
-     * - Nếu Render healthy → đọc từ Render
-     * - Nếu Render down → tự động fallover Railway
-     * - Nếu cả 2 down → return empty list
-     */
     public List<Student> getAllStudents() {
         if (primaryDbHealthy.get()) {
             try {
-                log.debug("📖 Reading from primary DB...");
-                List<Student> result = studentRepository.findAll();
-                log.info("✅ Read from primary DB: {} records found", result.size());
-                for (Student s : result) {
-                    log.debug("   - ID: {}, Name: {}, Email: {}", s.getId(), s.getName(), s.getEmail());
-                }
-                return result;
+                return studentRepository.findAll();
             } catch (Exception e) {
-                log.error("❌ ERROR reading from primary DB: {}", e.getMessage(), e);
-                log.warn("⚠️ Primary DB read failed, falling back to secondary");
                 primaryDbHealthy.set(false);
-                return fallbackToSecondary("SELECT * FROM students ORDER BY id");
+                primaryWasDown.set(true);
+                log.warn("Read primary failed. Fallback to secondary: {}", e.getMessage());
             }
-        } else {
-            log.info("⚠️ Primary DB is marked unhealthy, using secondary");
-            return fallbackToSecondary("SELECT * FROM students ORDER BY id");
-        }
-    }
-
-    /**
-     * ✅ Fallback logic - query Railway DB
-     */
-    private List<Student> fallbackToSecondary(String sql) {
-        if (!secondaryEnabled) {
-            log.error("❌ Secondary DB is disabled");
-            return List.of();
         }
 
-        try {
-            return secondaryJdbc.query(
-                sql,
-                (rs, rowNum) -> new Student(
-                    rs.getLong("id"),
-                    rs.getString("name"),
-                    rs.getString("email"),
-                    rs.getString("phone"),
-                    rs.getInt("age")
-                )
-            );
-        } catch (Exception e) {
-            log.error("❌ Secondary DB fallback also failed: {}", e.getMessage());
-            return List.of();
-        }
+        return queryStudentsFromSecondary("SELECT id, name, email, phone, age FROM students ORDER BY id");
     }
 
     public Student getStudentById(Long id) {
@@ -197,152 +142,62 @@ public class StudentService {
                 return studentRepository.findById(id).orElse(null);
             } catch (Exception e) {
                 primaryDbHealthy.set(false);
-                return fallbackGetStudentById(id);
+                primaryWasDown.set(true);
             }
-        } else {
-            return fallbackGetStudentById(id);
         }
-    }
-
-    private Student fallbackGetStudentById(Long id) {
-        if (!secondaryEnabled) return null;
 
         try {
             return secondaryJdbc.queryForObject(
-                "SELECT * FROM students WHERE id = ?",
-                new Object[]{id},
-                (rs, rowNum) -> new Student(
-                    rs.getLong("id"),
-                    rs.getString("name"),
-                    rs.getString("email"),
-                    rs.getString("phone"),
-                    rs.getInt("age")
-                )
+                    "SELECT id, name, email, phone, age FROM students WHERE id = ?",
+                    (rs, rowNum) -> new Student(
+                            rs.getLong("id"),
+                            rs.getString("name"),
+                            rs.getString("email"),
+                            rs.getString("phone"),
+                            rs.getInt("age")
+                    ),
+                    id
             );
         } catch (Exception e) {
-            log.error("❌ Failed to get student {} from secondary: {}", id, e.getMessage());
             return null;
         }
     }
-
-    // ============================================
-    // ✅ FIX 3: WRITE with Failover Support
-    // ============================================
 
     @Transactional
     public Student createStudent(Student student) {
         if (primaryDbHealthy.get()) {
             try {
-                // ✅ Primary write (main path)
-                log.debug("📝 Saving student: name={}, email={}", student.getName(), student.getEmail());
                 Student saved = studentRepository.save(student);
-                log.info("✅ Student {} INSERTED into primary DB: {}", saved.getId(), saved.getName());
-                
-                // ✅ Verify data was actually saved by reading back
-                try {
-                    Student verify = studentRepository.findById(saved.getId()).orElse(null);
-                    if (verify != null) {
-                        log.info("✅ VERIFIED: Student {} exists in primary DB after save", verify.getId());
-                    } else {
-                        log.error("❌ WARNING: Student {} not found after save! Data commit might have failed", saved.getId());
-                    }
-                } catch (Exception verifyEx) {
-                    log.error("❌ Failed to verify saved student: {}", verifyEx.getMessage());
-                }
-
-                // ✅ Async secondary write (with retry)
-                writeToSecondaryAsync(
-                    "INSERT INTO students (id, name, email, phone, age) VALUES (?, ?, ?, ?, ?)",
-                    saved.getId(), saved.getName(), saved.getEmail(), saved.getPhone(), saved.getAge()
-                );
-
+                writeStudentToSecondary(saved);
                 return saved;
-
             } catch (Exception e) {
-                log.error("❌ PRIMARY DB WRITE FAILED - Exception: {}", e.getMessage(), e);
-                log.warn("❌ Primary DB write failed, attempting secondary failover: {}", e.getMessage());
                 primaryDbHealthy.set(false);
-                
-                // ✅ Failover path: write to secondary
-                return createStudentInSecondary(student);
+                primaryWasDown.set(true);
+                log.warn("Create primary failed. Write to secondary: {}", e.getMessage());
             }
-        } else {
-            log.info("⚠️ Primary DB already marked unhealthy, writing to secondary");
-            return createStudentInSecondary(student);
-        }
-    }
-
-    private Student createStudentInSecondary(Student student) {
-        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
-            String msg = "❌ Both primary and secondary DBs are unavailable";
-            log.error(msg);
-            throw new RuntimeException(msg);
         }
 
-        try {
-            // Use RETURNING clause to get generated ID
-            Long id = secondaryJdbc.queryForObject(
-                "INSERT INTO students (name, email, phone, age) VALUES (?, ?, ?, ?) RETURNING id",
-                Long.class,
-                student.getName(), student.getEmail(), student.getPhone(), student.getAge()
-            );
-            
-            student.setId(id);
-            log.info("✅ Failover: Student {} created in secondary DB (Railway)", id);
-            return student;
-
-        } catch (Exception e) {
-            log.error("❌ Secondary failover also failed: {}", e.getMessage());
-            secondaryDbHealthy.set(false);
-            throw new RuntimeException("❌ Both primary and secondary DB are down: " + e.getMessage());
-        }
+        return createStudentInSecondary(student);
     }
 
     @Transactional
     public Student updateStudent(Long id, Student student) {
+        student.setId(id);
+
         if (primaryDbHealthy.get()) {
             try {
-                student.setId(id);
                 Student updated = studentRepository.save(student);
-                log.info("✅ Student {} updated in primary DB", id);
-
-                writeToSecondaryAsync(
-                    "UPDATE students SET name=?, email=?, phone=?, age=? WHERE id=?",
-                    updated.getName(), updated.getEmail(), updated.getPhone(), updated.getAge(), id
-                );
-
+                writeStudentToSecondary(updated);
                 return updated;
-
             } catch (Exception e) {
-                log.warn("❌ Primary update failed, attempting secondary failover: {}", e.getMessage());
                 primaryDbHealthy.set(false);
-                return updateStudentInSecondary(id, student);
+                primaryWasDown.set(true);
+                log.warn("Update primary failed. Update secondary: {}", e.getMessage());
             }
-        } else {
-            return updateStudentInSecondary(id, student);
-        }
-    }
-
-    private Student updateStudentInSecondary(Long id, Student student) {
-        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
-            throw new RuntimeException("❌ Secondary DB is unavailable for failover update");
         }
 
-        try {
-            student.setId(id);
-            secondaryJdbc.update(
-                "UPDATE students SET name=?, email=?, phone=?, age=? WHERE id=?",
-                student.getName(), student.getEmail(), student.getPhone(), student.getAge(), id
-            );
-            
-            log.info("✅ Failover: Student {} updated in secondary DB", id);
-            return student;
-
-        } catch (Exception e) {
-            log.error("❌ Secondary update failed: {}", e.getMessage());
-            secondaryDbHealthy.set(false);
-            throw new RuntimeException("❌ Update failed in both DBs: " + e.getMessage());
-        }
+        updateStudentInSecondary(id, student);
+        return student;
     }
 
     @Transactional
@@ -350,243 +205,260 @@ public class StudentService {
         if (primaryDbHealthy.get()) {
             try {
                 studentRepository.deleteById(id);
-                log.info("✅ Student {} deleted from primary DB", id);
-
-                writeToSecondaryAsync("DELETE FROM students WHERE id=?", id);
-
-            } catch (Exception e) {
-                log.warn("❌ Primary delete failed, attempting secondary failover: {}", e.getMessage());
-                primaryDbHealthy.set(false);
                 deleteStudentInSecondary(id);
+                return;
+            } catch (Exception e) {
+                primaryDbHealthy.set(false);
+                primaryWasDown.set(true);
+                log.warn("Delete primary failed. Delete secondary: {}", e.getMessage());
             }
-        } else {
-            deleteStudentInSecondary(id);
         }
+
+        deleteStudentInSecondary(id);
+    }
+
+    private Student createStudentInSecondary(Student student) {
+        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
+            throw new RuntimeException("Both primary and secondary DB are unavailable");
+        }
+
+        Long id = secondaryJdbc.queryForObject(
+                "INSERT INTO students (name, email, phone, age) VALUES (?, ?, ?, ?) RETURNING id",
+                Long.class,
+                student.getName(),
+                student.getEmail(),
+                student.getPhone(),
+                student.getAge()
+        );
+
+        student.setId(id);
+        primaryWasDown.set(true);
+        return student;
+    }
+
+    private void updateStudentInSecondary(Long id, Student student) {
+        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
+            throw new RuntimeException("Secondary DB is unavailable");
+        }
+
+        secondaryJdbc.update(
+                "UPDATE students SET name = ?, email = ?, phone = ?, age = ? WHERE id = ?",
+                student.getName(),
+                student.getEmail(),
+                student.getPhone(),
+                student.getAge(),
+                id
+        );
     }
 
     private void deleteStudentInSecondary(Long id) {
         if (!secondaryEnabled || !secondaryDbHealthy.get()) {
-            throw new RuntimeException("❌ Secondary DB is unavailable for failover delete");
+            throw new RuntimeException("Secondary DB is unavailable");
         }
 
-        try {
-            secondaryJdbc.update("DELETE FROM students WHERE id=?", id);
-            log.info("✅ Failover: Student {} deleted from secondary DB", id);
-
-        } catch (Exception e) {
-            log.error("❌ Secondary delete failed: {}", e.getMessage());
-            secondaryDbHealthy.set(false);
-            throw new RuntimeException("❌ Delete failed in both DBs: " + e.getMessage());
-        }
+        secondaryJdbc.update("DELETE FROM students WHERE id = ?", id);
     }
 
-    // ============================================
-    // ✅ FIX 2: Retry Logic with Exponential Backoff
-    // ============================================
-
     @Async
-    private void writeToSecondaryAsync(String sql, Object... args) {
-        if (!secondaryEnabled) {
+    public void writeStudentToSecondary(Student student) {
+        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
             return;
         }
 
-        int attempt = 0;
-        long delayMs = INITIAL_RETRY_DELAY_MS;
-
-        while (attempt < MAX_RETRIES) {
-            try {
-                secondaryJdbc.update(sql, args);
-                log.debug("✅ Secondary DB write successful (attempt {}/{})", attempt + 1, MAX_RETRIES);
-                return;  // Success - exit
-            } catch (Exception e) {
-                attempt++;
-
-                if (attempt < MAX_RETRIES) {
-                    log.warn("⚠️ Secondary write failed (attempt {}/{}), retrying in {}ms... Error: {}",
-                            attempt, MAX_RETRIES, delayMs, e.getMessage());
-                    try {
-                        Thread.sleep(delayMs);
-                        delayMs *= 2;  // Exponential backoff: 500ms → 1s → 2s
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        log.warn("⚠️ Retry sleep interrupted");
-                        return;
-                    }
-                } else {
-                    log.error("❌ Secondary DB write FAILED after {} attempts. Data will be synced later. Error: {}",
-                            MAX_RETRIES, e.getMessage());
-                    // Data inconsistency detected - next manual sync will fix it
-                }
-            }
-        }
-    }
-
-    // ============================================
-    // ✅ SYNC OPERATIONS
-    // ============================================
-
-    public String resetSecondaryDb() {
         try {
-            log.info("🚨 Clearing secondary database...");
-            secondaryJdbc.execute("TRUNCATE TABLE students CASCADE");
-            log.info("✅ Secondary DB cleared successfully");
-            syncToSecondaryAsync();
-            return "✅ Secondary DB reset and sync initiated";
+            secondaryJdbc.update("""
+                INSERT INTO students (id, name, email, phone, age)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (id)
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    email = EXCLUDED.email,
+                    phone = EXCLUDED.phone,
+                    age = EXCLUDED.age
+                """,
+                    student.getId(),
+                    student.getName(),
+                    student.getEmail(),
+                    student.getPhone(),
+                    student.getAge()
+            );
         } catch (Exception e) {
-            log.error("❌ Failed to reset secondary DB: {}", e.getMessage(), e);
-            return "❌ Reset failed: " + e.getMessage();
+            secondaryDbHealthy.set(false);
+            log.warn("Write student to secondary failed: {}", e.getMessage());
         }
     }
 
     @Async
-    private void syncToSecondaryAsync() {
+    public void syncFromSecondaryToPrimaryAsync() {
+        if (!isPrimaryConfigured() || reverseSyncInProgress.getAndSet(true)) {
+            return;
+        }
+
+        try {
+            List<Student> students = queryStudentsFromSecondary(
+                    "SELECT id, name, email, phone, age FROM students ORDER BY id"
+            );
+
+            for (Student student : students) {
+                primaryJdbc.update("""
+                    INSERT INTO students (id, name, email, phone, age)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (id)
+                    DO UPDATE SET
+                        name = EXCLUDED.name,
+                        email = EXCLUDED.email,
+                        phone = EXCLUDED.phone,
+                        age = EXCLUDED.age
+                    """,
+                        student.getId(),
+                        student.getName(),
+                        student.getEmail(),
+                        student.getPhone(),
+                        student.getAge()
+                );
+            }
+
+            log.warn("Reverse sync students completed: {}", students.size());
+        } catch (Exception e) {
+            primaryDbHealthy.set(false);
+            primaryWasDown.set(true);
+            log.error("Reverse sync students failed: {}", e.getMessage());
+        } finally {
+            reverseSyncInProgress.set(false);
+        }
+    }
+
+    @Async
+    public void syncToSecondaryAsync() {
         if (!secondaryEnabled || syncInProgress.getAndSet(true)) {
             return;
         }
 
         try {
-            log.info("🔄 Starting data sync from primary to secondary DB...");
-
-            List<Student> allStudents = studentRepository.findAll();
-            log.info("📊 Found {} students in primary DB", allStudents.size());
-
-            if (allStudents.isEmpty()) {
-                log.info("ℹ️ Primary DB is empty, skipping sync");
-                return;
+            List<Student> students = studentRepository.findAll();
+            for (Student student : students) {
+                writeStudentToSecondary(student);
             }
-
-            Integer secondaryCount = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
-            log.info("📊 Secondary DB currently has {} records", secondaryCount);
-
-            // ✅ UPSERT pattern: handles duplicates gracefully
-            for (Student student : allStudents) {
-                try {
-                    secondaryJdbc.update(
-                        "INSERT INTO students (id, name, email, phone, age) VALUES (?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email, phone = EXCLUDED.phone, age = EXCLUDED.age",
-                        student.getId(), student.getName(), student.getEmail(),
-                        student.getPhone(), student.getAge()
-                    );
-                } catch (Exception e) {
-                    log.warn("⚠️ Failed to sync student {}: {}", student.getId(), e.getMessage());
-                }
-            }
-
-            log.info("✅ Sync completed successfully");
-
-        } catch (Exception e) {
-            log.error("❌ Sync failed: {}", e.getMessage(), e);
         } finally {
             syncInProgress.set(false);
         }
     }
 
     public String manualSync() {
-        if (syncInProgress.get()) {
-            return "Sync already in progress...";
+        if (primaryDbHealthy.get()) {
+            syncToSecondaryAsync();
+            return "Sync primary -> secondary started";
         }
 
-        syncToSecondaryAsync();
-        return "Sync started (async, check logs)";
+        if (isPrimaryConfigured()) {
+            syncFromSecondaryToPrimaryAsync();
+            return "Reverse sync secondary -> primary started";
+        }
+
+        return "Primary DB is disabled. Nothing to sync to primary.";
     }
 
-    // ============================================
-    // ✅ FIX 4: DATA CONSISTENCY CHECK
-    // ============================================
+    public String resetSecondaryDb() {
+        try {
+            secondaryJdbc.execute("TRUNCATE TABLE students CASCADE");
+            if (primaryDbHealthy.get()) {
+                syncToSecondaryAsync();
+            }
+            return "Secondary students reset completed";
+        } catch (Exception e) {
+            return "Reset failed: " + e.getMessage();
+        }
+    }
 
     public Map<String, Object> checkDataConsistency() {
         long primaryCount = -1;
         long secondaryCount = -1;
-        List<String> inconsistencies = new ArrayList<>();
-        boolean isConsistent = false;
 
         try {
-            primaryCount = studentRepository.count();
+            if (primaryDbHealthy.get()) {
+                primaryCount = studentRepository.count();
+            }
         } catch (Exception e) {
-            log.error("❌ Cannot count primary: {}", e.getMessage());
-            inconsistencies.add("Cannot access primary DB: " + e.getMessage());
+            primaryDbHealthy.set(false);
+            primaryWasDown.set(true);
         }
 
-        if (secondaryEnabled) {
-            try {
-                secondaryCount = secondaryJdbc.queryForObject(
-                    "SELECT COUNT(*) FROM students",
-                    Long.class
-                );
-            } catch (Exception e) {
-                log.error("❌ Cannot count secondary: {}", e.getMessage());
-                inconsistencies.add("Cannot access secondary DB: " + e.getMessage());
-                secondaryCount = -1;
-            }
-        } else {
-            inconsistencies.add("Secondary DB is disabled");
+        try {
+            secondaryCount = secondaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Long.class);
+        } catch (Exception e) {
+            secondaryDbHealthy.set(false);
         }
 
-        // Check consistency
-        if (primaryCount >= 0 && secondaryCount >= 0) {
-            if (primaryCount == secondaryCount) {
-                isConsistent = true;
-                log.info("✅ Data is consistent: {} records in both DBs", primaryCount);
-            } else {
-                inconsistencies.add(String.format(
-                    "Record count mismatch: Primary has %d records, Secondary has %d records",
-                    primaryCount, secondaryCount
-                ));
-                log.warn("⚠️ Data inconsistency detected: Primary=%d, Secondary=%d", primaryCount, secondaryCount);
-            }
-        }
+        boolean consistent = primaryCount >= 0 && secondaryCount >= 0 && primaryCount == secondaryCount;
 
         return Map.of(
-            "primary_count", primaryCount,
-            "secondary_count", secondaryCount,
-            "consistent", isConsistent,
-            "primary_healthy", primaryDbHealthy.get(),
-            "secondary_healthy", secondaryDbHealthy.get(),
-            "inconsistencies", inconsistencies
+                "primary_enabled", isPrimaryConfigured(),
+                "primary_healthy", primaryDbHealthy.get(),
+                "secondary_healthy", secondaryDbHealthy.get(),
+                "primary_count", primaryCount,
+                "secondary_count", secondaryCount,
+                "consistent", consistent
         );
     }
-
-    // ============================================
-    // ✅ HEALTH STATUS
-    // ============================================
 
     public String getHealthStatus() {
         return String.format(
-            "Primary: %s | Secondary: %s | Sync: %s | Consistent: %b",
-            primaryDbHealthy.get() ? "✅ UP" : "❌ DOWN",
-            secondaryEnabled ? (secondaryDbHealthy.get() ? "✅ UP" : "❌ DOWN") : "⚠️ DISABLED",
-            syncInProgress.get() ? "🔄 IN_PROGRESS" : "✅ IDLE",
-            checkDataConsistency().get("consistent")
+                "Primary enabled: %s | Primary: %s | Secondary: %s",
+                isPrimaryConfigured(),
+                primaryDbHealthy.get() ? "UP" : "DOWN",
+                secondaryDbHealthy.get() ? "UP" : "DOWN"
         );
     }
 
-    // ============================================
-    // ✅ DEBUG HELPERS
-    // ============================================
-
     public List<Student> queryPrimaryDirect() {
-        try {
-            return primaryJdbc.query(
-                "SELECT * FROM students ORDER BY id",
+        if (!primaryDbHealthy.get()) {
+            return List.of();
+        }
+
+        return primaryJdbc.query(
+                "SELECT id, name, email, phone, age FROM students ORDER BY id",
                 (rs, rowNum) -> new Student(
-                    rs.getLong("id"),
-                    rs.getString("name"),
-                    rs.getString("email"),
-                    rs.getString("phone"),
-                    rs.getInt("age")
+                        rs.getLong("id"),
+                        rs.getString("name"),
+                        rs.getString("email"),
+                        rs.getString("phone"),
+                        rs.getInt("age")
                 )
+        );
+    }
+
+    public int getPrimaryCountDirect() {
+        if (!primaryDbHealthy.get()) {
+            return -1;
+        }
+
+        return primaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
+    }
+
+    private List<Student> queryStudentsFromSecondary(String sql) {
+        if (!secondaryEnabled || !secondaryDbHealthy.get()) {
+            return List.of();
+        }
+
+        try {
+            return secondaryJdbc.query(
+                    sql,
+                    (rs, rowNum) -> new Student(
+                            rs.getLong("id"),
+                            rs.getString("name"),
+                            rs.getString("email"),
+                            rs.getString("phone"),
+                            rs.getInt("age")
+                    )
             );
         } catch (Exception e) {
-            log.error("❌ Direct query to primary failed: {}", e.getMessage());
+            secondaryDbHealthy.set(false);
+            log.warn("Query secondary failed: {}", e.getMessage());
             return List.of();
         }
     }
 
-    public int getPrimaryCountDirect() {
-        try {
-            return primaryJdbc.queryForObject("SELECT COUNT(*) FROM students", Integer.class);
-        } catch (Exception e) {
-            log.error("❌ Count query to primary failed: {}", e.getMessage());
-            return -1;
-        }
+    private boolean isPrimaryConfigured() {
+        return primaryEnabled && primaryUrl != null && !primaryUrl.trim().isEmpty();
     }
 }
